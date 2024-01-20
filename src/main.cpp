@@ -10,17 +10,29 @@
 #include <html.h>
 
 // Define GPIO pins
-const int relayPin = 12;          // GPIO pin number connected to relay IN
-const int buzzerPin = 15;         // GPIO pin number connected to buzzer
-const int waterSensorPin = 4;     // GPIO pin number connected to water
-volatile bool shouldWater = true; // Flag to indicate water detection
+const int relayPin = 12;      // GPIO pin number connected to relay IN
+const int buzzerPin = 15;     // GPIO pin number connected to buzzer
+const int waterSensorPin = 4; // GPIO pin number connected to water
+const int builtInLEDPin = 2;  // GPIO pin number connected to on board LED
 
 int waterFrequency = 30;
 int waterDuration = 3000;
+bool mDNSFailed = false;
+
+bool shouldWater()
+{
+  bool canWater = true;
+  if (digitalRead(waterSensorPin) == LOW)
+  {
+    // If the pin is HIGH, water is detected
+    canWater = false;
+  }
+  return canWater;
+}
 
 void water(int delayMs)
 {
-  if (shouldWater)
+  if (shouldWater())
   {
     Serial.println("Watering...");
     digitalWrite(relayPin, HIGH); // Turn on the relay
@@ -36,7 +48,7 @@ void water(int delayMs)
 
 void waterTaskCallback()
 {
-  if (shouldWater)
+  if (shouldWater())
   {
     water(waterDuration);
 
@@ -68,20 +80,6 @@ enum WiFiState
 WiFiState currentState;
 WebServer server(80);
 Scheduler ts;
-
-void IRAM_ATTR waterSensorISR()
-{
-  if (digitalRead(waterSensorPin) == LOW)
-  {
-    // If the pin is HIGH, water is detected
-    shouldWater = false;
-  }
-  else
-  {
-    // If the pin is LOW, water is not detected
-    shouldWater = true;
-  }
-}
 
 void updateWaterTaskFrequency(int newFrequency)
 {
@@ -153,17 +151,13 @@ void handle_NotFound()
 
 void handle_Water()
 {
-  if (shouldWater)
+  if (shouldWater())
   {
     int waterResult = digitalRead(waterSensorPin);
     Serial.println(waterFrequency);
     Serial.println(waterDuration);
     water(waterDuration);
     playRandom(buzzerPin);
-  }
-  else
-  {
-    Serial.println("Water detected, skipping...");
   }
   server.sendHeader("Location", "/"); // Set the redirect location to root
   server.send(302);                   // Send a 302 redirect response
@@ -195,6 +189,19 @@ void handle_ConfigPost()
   server.send(302);                   // Send a 302 redirect response
 }
 
+void handle_Diagnostic()
+{
+  String json = "{";
+  json += "\"heap\": " + String(ESP.getFreeHeap());
+  json += ", \"maxAllocHeap\": " + String(ESP.getMaxAllocHeap());
+  json += ", \"chipId\": \"" + String((uint32_t)ESP.getEfuseMac(), HEX) + "\"";
+  json += ", \"sdkVersion\": \"" + String(ESP.getSdkVersion()) + "\"";
+  json += ", \"shouldWater\": \"" + String(shouldWater()) + "\"";
+  json += ", \"mDNSFailed\": \"" + String(mDNSFailed) + "\"";
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
 void setup()
 {
 
@@ -203,23 +210,12 @@ void setup()
   pinMode(relayPin, OUTPUT);
   pinMode(buzzerPin, OUTPUT);
   pinMode(waterSensorPin, INPUT_PULLUP); // Set the water sensor pin as input
-  attachInterrupt(digitalPinToInterrupt(waterSensorPin), waterSensorISR, CHANGE);
+  pinMode(builtInLEDPin, OUTPUT);
 
   // Initialize and configure NTP for Denver, Colorado (Mountain Time Zone)
   configTime(-7 * 3600, 3600, "pool.ntp.org", "time.nist.gov"); // UTC-7 hours offset, 3600 seconds for DST
   setenv("TZ", "MST7MDT,M3.2.0,M11.1.0", 1);                    // Set timezone to Mountain Time with DST rules
   tzset();                                                      // Apply the timezone settings
-
-  if (digitalRead(waterSensorPin) == LOW)
-  {
-    // If the pin is HIGH, water is detected
-    shouldWater = false;
-  }
-  else
-  {
-    // If the pin is LOW, water is not detected
-    shouldWater = true;
-  }
 
   if (!SPIFFS.begin(true))
   {
@@ -244,28 +240,14 @@ void setup()
     Serial.println("Connected to WiFi!");
     currentState = STATION_MODE;
   }
-  else
-  {
-    Serial.println("Failed to connect. Entering Access Point mode");
-    currentState = ACCESS_POINT;
-  }
 
-  switch (currentState)
+  if (currentState == STATION_MODE)
   {
-  case ACCESS_POINT:
-    Serial.println("Current State: ACCESS_POINT");
-    break;
-  case STATION_MODE:
-    Serial.println("Current State: STATION_MODE");
-
-    // Initialize mDNS
-    if (!MDNS.begin("water"))
-    { // Set the hostname to "esp32.local"
+    if (!MDNS.begin("water2"))
+    {
       Serial.println("Error setting up MDNS responder!");
-      while (1)
-      {
-        delay(1000);
-      }
+      digitalWrite(builtInLEDPin, HIGH); // Turn the LED on
+      mDNSFailed = true;
     }
 
     Serial.println("mDNS responder started");
@@ -274,6 +256,7 @@ void setup()
     server.on("/water", handle_Water);
     server.on("/config", HTTP_GET, handle_ConfigGet);
     server.on("/config", HTTP_POST, handle_ConfigPost);
+    server.on("/diagnostic", HTTP_GET, handle_Diagnostic);
     server.onNotFound(handle_NotFound);
 
     server.begin();
